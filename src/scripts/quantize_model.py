@@ -4,106 +4,130 @@ import tensorflow as tf
 import joblib
 import time
 import os
+import psutil
+import mlflow
+import matplotlib.pyplot as plt
+from tensorflow.keras import layers, models
 
-def evaluate_tflite_metrics(tflite_model, X_test, y_test):
-    """Avalia acurácia e tempo médio de inferência para modelos TFLite."""
+# REQUISITO PARA O JOBLIB
+def create_dnn_model(meta=None):
+    n_features = meta["n_features_in_"] if meta else 47 
+    model = models.Sequential([
+        layers.Dense(64, activation='relu', input_shape=(n_features,)),
+        layers.BatchNormalization(),
+        layers.Dropout(0.2),
+        layers.Dense(32, activation='relu'),
+        layers.Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+def get_ram_usage():
+    return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+
+def evaluate_tflite(tflite_model, X_test, y_test):
     interpreter = tf.lite.Interpreter(model_content=tflite_model)
     interpreter.allocate_tensors()
+    input_idx = interpreter.get_input_details()[0]['index']
+    output_idx = interpreter.get_output_details()[0]['index']
 
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-
-    correct_predictions = 0
+    correct = 0
     start_time = time.time()
+    ram_initial = get_ram_usage()
 
     for i in range(len(X_test)):
         input_data = X_test[i:i+1].astype(np.float32)
-        interpreter.set_tensor(input_details[0]['index'], input_data)
+        interpreter.set_tensor(input_idx, input_data)
         interpreter.invoke()
-        output_data = interpreter.get_tensor(output_details[0]['index'])
-        
-        prediction = (output_data[0][0] > 0.5).astype(int)
-        if prediction == y_test.iloc[i]:
-            correct_predictions += 1
-            
-    end_time = time.time()
-    avg_time = (end_time - start_time) / len(X_test)
-    accuracy = correct_predictions / len(X_test)
-    return accuracy, avg_time
+        output = interpreter.get_tensor(output_idx)
+        if (output[0][0] > 0.5) == y_test.iloc[i]:
+            correct += 1
 
-def quantizar_completo(pipeline_path, data_path):
-    # 1. Carregar Pipeline e Dados
+    total_time = (time.time() - start_time) / len(X_test)
+    ram_final = get_ram_usage()
+    return (correct / len(X_test)), total_time, (ram_final - ram_initial)
+
+def gerar_dashboard(results):
+    names = [r['name'] for r in results]
+    sizes = [float(r['size'].split()[0]) for r in results]
+    times = [float(r['time'].split()[0]) for r in results]
+    accs = [float(r['acc']) for r in results]
+
+    fig, ax = plt.subplots(1, 3, figsize=(18, 5))
+    
+    ax[0].bar(names, sizes, color=['blue', 'orange', 'green'])
+    ax[0].set_title('Tamanho do Modelo (KB)')
+    
+    ax[1].bar(names, times, color=['blue', 'orange', 'green'])
+    ax[1].set_title('Latência (ms/amostra)')
+
+    ax[2].plot(names, accs, marker='o', linestyle='-', color='red')
+    ax[2].set_title('Acurácia')
+    ax[2].set_ylim([min(accs)-0.01, 1.0])
+
+    plt.tight_layout()
+    plt.savefig('dashboard_quantizacao.png')
+    print("\n[INFO] Dashboard salvo como 'dashboard_quantizacao.png'")
+    plt.show()
+
+def comparar_e_registrar_mlflow(pipeline_path, data_path):
+    caminho_db = os.path.abspath(r"src\scripts\mlflow.db")
+    mlflow.set_tracking_uri(f"sqlite:///{caminho_db}")
+    mlflow.set_experiment("Quantizacao_Deep_Learning")
+
     pipeline = joblib.load(pipeline_path)
     df = pd.read_csv(data_path)
-    X = df.drop('Is_Fraud', axis=1)
+    X_scaled = pipeline.named_steps['scaler'].transform(df.drop('Is_Fraud', axis=1)).astype(np.float32)
     y = df['Is_Fraud']
-
-    # O Pipeline já contém o Scaler, então aplicamos ele
-    X_scaled = pipeline.named_steps['scaler'].transform(X).astype(np.float32)
-    
-    # Extrair o modelo Keras de dentro do Pipeline (SciKeras)
     model_keras = pipeline.named_steps['model'].model_
 
-    # 2. Conversões TFLite
-    formats = []
+    X_eval, y_eval = X_scaled[:500], y[:500]
+    results_to_table = []
     
-    # --- FLOAT 32 ---
-    converter = tf.lite.TFLiteConverter.from_keras_model(model_keras)
-    tflite_f32 = converter.convert()
-    acc_32, time_32 = evaluate_tflite_metrics(tflite_f32, X_scaled[:500], y[:500])
-    formats.append(('Float32', tflite_f32, acc_32, time_32))
+    configs = [
+        ('Float32', None, False),
+        ('Float16', [tf.lite.Optimize.DEFAULT], False),
+        ('INT8', [tf.lite.Optimize.DEFAULT], True)
+    ]
 
-    # --- FLOAT 16 ---
-    converter = tf.lite.TFLiteConverter.from_keras_model(model_keras)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    converter.target_spec.supported_types = [tf.float16]
-    tflite_f16 = converter.convert()
-    acc_16, time_16 = evaluate_tflite_metrics(tflite_f16, X_scaled[:500], y[:500])
-    formats.append(('Float16', tflite_f16, acc_16, time_16))
+    for name, opt, is_int8 in configs:
+        with mlflow.start_run(run_name=f"TFLite_{name}"):
+            converter = tf.lite.TFLiteConverter.from_keras_model(model_keras)
+            if opt: converter.optimizations = opt
+            if name == 'Float16': converter.target_spec.supported_types = [tf.float16]
+            if is_int8:
+                converter.representative_dataset = lambda: ([X_eval[i:i+1]] for i in range(100))
+                converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
 
-    # --- INT8 (PTQ) ---
-    converter = tf.lite.TFLiteConverter.from_keras_model(model_keras)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    def representative_data_gen():
-        for i in range(100):
-            yield [X_scaled[i:i+1]]
-    converter.representative_dataset = representative_data_gen
-    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-    tflite_int8 = converter.convert()
-    acc_i8, time_i8 = evaluate_tflite_metrics(tflite_int8, X_scaled[:500], y[:500])
-    formats.append(('INT8', tflite_int8, acc_i8, time_i8))
+            tflite_model = converter.convert()
+            acc, t_sample, ram_delta = evaluate_tflite(tflite_model, X_eval, y_eval)
+            
+            # Salvamento local temporário para o MLflow
+            tflite_filename = f"model_{name}.tflite"
+            with open(tflite_filename, "wb") as f:
+                f.write(tflite_model)
 
-    # 3. TABELA COMPARATIVA
-    print('='*85)
-    print(' TABELA COMPARATIVA — FORMATOS DE QUANTIZAÇÃO (DNN FRAUDE)')
-    print('='*85)
-    print(f'{"Formato":>10} | {"Tamanho":>12} | {"Tempo/amostra":>14} | {"Acurácia":>10} | {"Saving"}')
-    print('-'*85)
+            # Log MLflow
+            mlflow.log_metric("accuracy", acc)
+            mlflow.log_metric("latency_ms", t_sample * 1000)
+            mlflow.log_metric("size_kb", len(tflite_model)/1024)
+            mlflow.log_artifact(tflite_filename)
+            
+            results_to_table.append({
+                'name': name, 'size': f"{len(tflite_model)/1024:.1f} KB",
+                'time': f"{t_sample*1000:.3f} ms", 'ram': f"{max(ram_delta, 0.01):.3f} MB", 'acc': f"{acc:.4f}"
+            })
+            os.remove(tflite_filename)
+
+    # Exibir Tabela
+    print('\n' + '='*76)
+    print(f'{"Formato":>10} | {"Tamanho":>12} | {"Tempo/amostra":>14} | {"RAM":>8} | {"Acurácia":>9}')
+    print('-'*76)
+    for r in results_to_table:
+        print(f"{r['name']:>10} | {r['size']:>12} | {r['time']:>14} | {r['ram']:>8} | {r['acc']:>9}")
     
-    f32_size = len(tflite_f32)
-    for name, model_bytes, acc, t in formats:
-        size_kb = len(model_bytes) / 1024
-        reduction = f32_size / len(model_bytes)
-        print(f'{name:>10} | {size_kb:>9.2f} KB | {t*1000:>11.4f} ms | {acc:>10.4f} | {reduction:>5.1f}x')
-    print('='*85)
-
-    # 4. ESTIMATIVA DE CONSUMO (Cortex-M4)
-    print('\n' + '='*75)
-    print(' ESTIMATIVA DE CONSUMO — 1000 INFERÊNCIAS (Ref: ARM Cortex-M4)')
-    print('='*75)
-    print(f'{"Formato":>10} | {"Energia":>12} | {"Saving (%)":>12} | {"Inf. por bateria"}')
-    print('-'*75)
-    
-    # Referências proporcionais ao seu exemplo
-    energy_ref = {"Float32": 42.0, "Float16": 16.0, "INT8": 5.7}
-    inf_ref = {"Float32": "~9.4M", "Float16": "~24.7M", "INT8": "~69.3M"}
-
-    for name, _, _, _ in formats:
-        saving = 100 * (1 - (energy_ref[name]/42.0))
-        print(f'{name:>10} | {energy_ref[name]:>9.1f} mJ | {saving:>11.1f}% | {inf_ref[name]:>16}')
-    print('='*75)
+    gerar_dashboard(results_to_table)
 
 if __name__ == "__main__":
-    PIPELINE_PATH = r'src/modelos/pipeline_dnn_fraude.pkl'
-    DATA_PATH = r'data/processed/healthcare_fraud_final_model.csv'
-    quantizar_completo(PIPELINE_PATH, DATA_PATH)
+    comparar_e_registrar_mlflow(r'src/modelos/pipeline_dnn_fraude.pkl', 
+                                 r'data/processed/healthcare_fraud_final_model.csv')
