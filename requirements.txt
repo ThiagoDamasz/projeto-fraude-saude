@@ -12,3 +12,4 @@ pytest
 seaborn
 imbalanced-learn
 tensorflow
+keras
