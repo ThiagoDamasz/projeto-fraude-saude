@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+from sklearn.pipeline import Pipeline
 import joblib
 import pandas as pd
 import os
@@ -8,12 +9,10 @@ from typing import Dict, Any
 app = FastAPI(title="API de detecção de fraudes de saúde")
 
 # 1. Carregar o modelo ao iniciar a API
-# Ajuste o caminho conforme sua estrutura de pastas
 model_path = os.path.join(os.path.dirname(__file__), r'C:\Users\User\Desktop\projetos\projeto-fraude-saude\src\modelos\pipeline_fraude_saude_v1.pkl')
 model = joblib.load(model_path)
 
 # 2. Definir o esquema de entrada (Exemplo com algumas colunas)
-# Você deve incluir aqui todas as colunas que o modelo espera (as 47 colunas)
 class ClaimData(BaseModel):
     Patient_Age: float
     Claim_Amount: float
@@ -35,6 +34,30 @@ class ClaimData(BaseModel):
 @app.get("/")
 def read_root():
     return {"message": "API de Detecção de Fraude está online!"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_loaded": True}
+
+@app.get("/model-info")
+def model_info():
+    # Se você estiver usando o pipeline do Scikit-Learn
+    # podemos extrair informações dinamicamente do objeto carregado
+    scikit_model = model.named_steps['model']
+    
+    return {
+        "model_type": "Logistic Regression",
+        "algorithm": "Generalized Linear Model",
+        "parameters": {
+            "penalty": scikit_model.get_params().get("penalty"),
+            "C_regularization": scikit_model.get_params().get("C"),
+            "solver": scikit_model.get_params().get("solver")
+        },
+        "input_features_count": len(model.feature_names_in_) if hasattr(model, 'feature_names_in_') else 47,
+        "feature_names": list(model.feature_names_in_) if hasattr(model, 'feature_names_in_') else "Lista de 47 features",
+        "output_type": "Probability (0 to 1)",
+        "target_class": "Is_Fraud"
+    }
 
 @app.post("/predict")
 def predict_fraud(data: ClaimData):
