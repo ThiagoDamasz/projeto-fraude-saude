@@ -1,1 +1,9 @@
+.venv/
 venv/
+env/
+
+mlruns/
+artifacts/
+data/raw-data
+data/processed
+
