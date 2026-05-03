@@ -8,8 +8,13 @@ from typing import Dict, Any
 
 app = FastAPI(title="API de detecção de fraudes de saúde")
 
-# 1. Carregar o modelo ao iniciar a API
-model_path = os.path.join(os.path.dirname(__file__), r'C:\Users\User\Desktop\projetos\projeto-fraude-saude\src\modelos\pipeline_fraude_saude_v1.pkl')
+# 1. Pega o caminho da pasta onde este arquivo (main.py) está: /app/src/app
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 2. Constrói o caminho subindo um nível (..) para sair de 'app' e entrar em 'modelos'
+model_path = os.path.join(BASE_DIR, "..", "modelos", "pipeline_fraude_saude_v1.pkl")
+
+# 3. Carrega o modelo
 model = joblib.load(model_path)
 
 # 2. Definir o esquema de entrada (Exemplo com algumas colunas)
